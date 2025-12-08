@@ -2,16 +2,22 @@ import { WebSocketServer } from 'ws';
 import { Kafka } from 'kafkajs';
 import { DocumentSession } from './services/DocumentSession';
 
-const PORT = 8081; // Using Port 8081
+// 🛠️ FIX 1: Use process.env.PORT for Railway, or fallback to 8081
+const PORT = process.env.PORT ? parseInt(process.env.PORT) : 8081; 
 const wss = new WebSocketServer({ port: PORT });
 
 // Store active document sessions in memory
 const sessions = new Map<string, DocumentSession>();
 
+// 🛠️ FIX 2: Use KAFKA_URL environment variable provided by Railway
+const KAFKA_BROKERS = process.env.KAFKA_URL 
+    ? [process.env.KAFKA_URL.split(',')[0]] // Use first broker if multiple are provided
+    : ['localhost:9092']; // Fallback for local testing
+
 // Setup Kafka Client
 const kafka = new Kafka({ 
     clientId: 'editor-service', 
-    brokers: ['localhost:9092'], // Connecting to Docker Kafka
+    brokers: KAFKA_BROKERS, // Use the fixed brokers list
     retry: {
         initialRetryTime: 100,
         retries: 8
@@ -31,6 +37,9 @@ async function startServer() {
             const params = new URLSearchParams(req.url?.split('?')[1]);
             const docId = params.get('docId') || 'default-doc';
             const userId = params.get('userId') || 'user-' + Math.floor(Math.random() * 1000);
+            
+            // Set a default role, as no auth logic is present in this file
+            const defaultRole = 'editor'; 
 
             // Create a session for this document if it doesn't exist
             if (!sessions.has(docId)) {
@@ -39,11 +48,12 @@ async function startServer() {
             }
 
             const session = sessions.get(docId)!;
-            session.addUser(ws, userId);
+            
+            // 🛠️ FIX 3: Add the missing 'role' argument to the function call
+            session.addUser(ws, userId, defaultRole); 
 
             // Handle incoming messages (Edits, Cursors)
             ws.on('message', (data) => {
-                // 🔴 THIS IS THE DEBUG LOG WE NEED:
                 console.log(`📩 Received from ${userId}: ${data}`); 
 
                 try {

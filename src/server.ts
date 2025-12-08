@@ -6,38 +6,78 @@ import Redis from 'ioredis';
 import cors from 'cors';
 import { Kafka } from 'kafkajs';
 
+// 1. Setup Express and CORS
 const app = express();
-app.use(cors());
+const allowedOrigins = ['https://abhinandancte.vercel.app', 'http://localhost:5173']; 
+
+app.use(cors({
+    origin: allowedOrigins,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    credentials: true,
+}));
 app.use(express.json());
 
+// 2. Setup HTTP and WebSocket Server
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// 🟢 FIX: Use Environment Variables for Docker
-const REDIS_HOST = process.env.REDIS_HOST || 'localhost';
-const KAFKA_BROKER = process.env.KAFKA_BROKER || 'localhost:9092';
+// 3. Setup Environment Variables and Port
+const PORT = process.env.PORT ? parseInt(process.env.PORT) : 8081; 
+const REDIS_URL = process.env.REDIS_URL || "redis://default:RtfJevPbBmwicENQmqqRdRJegVzQojAg@redis.railway.internal:6379";
+const KAFKA_BROKER = process.env.KAFKA_URL ? process.env.KAFKA_URL.split(',')[0] : "kafka-broker.railway.internal:9092";
 
-console.log(`Connecting to Redis at ${REDIS_HOST}...`);
-const redis = new Redis({ host: REDIS_HOST, port: 6379 });
+// 4. Initialize Services
+console.log(`Connecting to Redis...`);
+const redis = new Redis(REDIS_URL, { maxRetriesPerRequest: 2,});
 
-console.log(`Connecting to Kafka at ${KAFKA_BROKER}...`);
+console.log(`Setting up Kafka at ${KAFKA_BROKER}...`);
 const kafka = new Kafka({ clientId: 'collab-app', brokers: [KAFKA_BROKER] });
 const producer = kafka.producer();
-
 const sessions = new Map<string, DocumentSession>();
 
-// --- HELPER ---
+// 🎯 FIX 1: Use a module-level variable to track Kafka connection state
+let kafkaReady = false;
+
+// --- Kafka Status Checks ---
+producer.on('producer.connect', () => {
+    kafkaReady = true; // Set flag to true when connected
+    console.log("✅ KAFKA STATUS: Producer connected and ready for events.");
+});
+producer.on('producer.disconnect', (error) => {
+    kafkaReady = false; // Set flag to false if disconnected
+    console.error("❌ KAFKA STATUS: Producer disconnected! Check Railway configuration.", error);
+});
+
+// --- HELPER FUNCTIONS ---
+
 async function isOwner(docId: string, userId: string) {
     const owner = await redis.get(`doc_owner:${docId}`);
     return owner === userId;
 }
 
-// --- APIs ---
+// 🟢 NEW HELPER: Get the effective role for a user (fixes Share button issue)
+async function getUserRole(docId: string, userId: string): Promise<string> {
+    // 1. Check for explicit role in the document's ACL (e.g., 'owner', 'editor', 'viewer')
+    const explicitRole = await redis.hget(`doc_acl:${docId}`, userId);
+    if (explicitRole) return explicitRole;
+    
+    // 2. If no explicit role, check the general "Link Access" setting
+    const linkAccess = await redis.hget(`doc_settings:${docId}`, 'link_access');
+    
+    // 3. Return the link setting if it exists (e.g. 'viewer'), otherwise default to 'none'
+    return linkAccess || 'none'; 
+}
+
+// --- REST APIs ---
 
 app.get('/api/docs/:userId', async (req, res) => {
-    const { userId } = req.params;
-    const docs = await redis.smembers(`user_docs:${userId}`);
-    res.json(docs);
+    if (kafkaReady) { 
+        const { userId } = req.params;
+        const docs = await redis.smembers(`user_docs:${userId}`);
+        res.json(docs);
+    } else {
+        res.status(503).json({ error: "Service Unavailable: Kafka not ready." });
+    }
 });
 
 app.post('/api/docs', async (req, res) => {
@@ -52,7 +92,7 @@ app.post('/api/docs', async (req, res) => {
     res.json({ success: true });
 });
 
-// 🟢 GET PERMISSIONS & LINK SETTINGS
+// GET PERMISSIONS & LINK SETTINGS
 app.get('/api/doc/:docId/users', async (req, res) => {
     const { docId } = req.params;
     // 1. Get specific user list (ACL)
@@ -63,7 +103,7 @@ app.get('/api/doc/:docId/users', async (req, res) => {
     res.json({ acl, linkAccess });
 });
 
-// 🟢 INVITE / UPDATE USER ROLE
+// INVITE / UPDATE USER ROLE
 app.post('/api/doc/:docId/user', async (req, res) => {
     const { docId, ownerId, email, role } = req.body; 
     if (!await isOwner(docId, ownerId)) return res.status(403).json({ error: "Not owner" });
@@ -73,7 +113,7 @@ app.post('/api/doc/:docId/user', async (req, res) => {
     res.json({ success: true });
 });
 
-// 🟢 REVOKE USER ACCESS
+// REVOKE USER ACCESS
 app.delete('/api/doc/:docId/user', async (req, res) => {
     const { docId, ownerId, email } = req.body;
     if (!await isOwner(docId, ownerId)) return res.status(403).json({ error: "Not owner" });
@@ -82,7 +122,7 @@ app.delete('/api/doc/:docId/user', async (req, res) => {
     res.json({ success: true });
 });
 
-// 🟢 UPDATE GENERAL LINK ACCESS
+// UPDATE GENERAL LINK ACCESS
 app.post('/api/doc/:docId/link-settings', async (req, res) => {
     const { docId, ownerId, linkAccess } = req.body; // 'none'|'viewer'|'commenter'|'editor'
     if (!await isOwner(docId, ownerId)) return res.status(403).json({ error: "Not owner" });
@@ -107,10 +147,19 @@ app.post('/api/doc/:docId/tabs', async (req, res) => {
     res.json({ success: true });
 });
 
+
+// --- Main Server Start Logic ---
 (async () => {
+    // 1. Start HTTP/WS server immediately (CRITICAL for CORS/502 fix)
+    server.listen(PORT, () => {
+        console.log(`🚀 HTTP/WS Server listening immediately on port ${PORT}`);
+    });
+
     try {
-        await producer.connect();
+        // 2. Connect to Kafka asynchronously
+        await producer.connect(); 
         
+        // 3. Setup WebSocket connection handling (runs non-blocking)
         wss.on('connection', async (ws, req) => {
             const urlParams = new URLSearchParams(req.url?.split('?')[1]);
             const docId = urlParams.get('docId');
@@ -118,29 +167,17 @@ app.post('/api/doc/:docId/tabs', async (req, res) => {
             const userId = urlParams.get('userId');
 
             if (!docId || !userId || !tabId) { ws.close(); return; }
+            
+            // 🟢 AUTH LOGIC START (Updated to use DB)
+            const userRole = await getUserRole(docId, userId);
 
-            // 🟢 AUTH LOGIC START
-            const owner = await redis.get(`doc_owner:${docId}`);
-            let role = await redis.hget(`doc_acl:${docId}`, userId);
-            const linkSetting = await redis.hget(`doc_settings:${docId}`, 'link_access') || 'none';
-
-            // If not owner AND not explicitly invited
-            if (userId !== owner && !role) {
-                if (linkSetting !== 'none') {
-                    // Grant access based on Public Link Setting
-                    role = linkSetting; 
-                    console.log(`${userId} joining via Link as ${role}`);
-                } else {
-                    // Block access
-                    console.log(`⛔ BLOCKING ${userId} from ${docId}`);
-                    ws.send(JSON.stringify({ type: 'error', message: 'Access Denied.' }));
-                    ws.close();
-                    return;
-                }
+            if (userRole === 'none') {
+                console.log(`⛔ Access denied for ${userId} on doc ${docId}`);
+                ws.send(JSON.stringify({ type: 'error', message: "Access Denied: You do not have permission to view this document." }));
+                ws.close();
+                return;
             }
             // 🟢 AUTH LOGIC END
-
-            const finalRole = (userId === owner) ? 'owner' : role;
 
             const sessionKey = `${docId}::${tabId}`;
             if (!sessions.has(sessionKey)) {
@@ -148,11 +185,13 @@ app.post('/api/doc/:docId/tabs', async (req, res) => {
             }
 
             const session = sessions.get(sessionKey)!;
-            const connectionId = await session.addUser(ws, userId, finalRole || 'viewer');
+            
+            // 💡 FIX: Pass the real role retrieved from Redis
+            const connectionId = await session.addUser(ws, userId, userRole); 
 
             ws.on('message', (message) => {
                 const data = JSON.parse(message.toString());
-                session.handleEdit(connectionId, data);
+                session.handleEdit(connectionId, data); 
             });
 
             ws.on('close', () => {
@@ -160,9 +199,8 @@ app.post('/api/doc/:docId/tabs', async (req, res) => {
             });
         });
 
-        const PORT = 8081;
-        server.listen(PORT, () => {
-            console.log(`🚀 Server running on port ${PORT}`);
-        });
-    } catch (e) { console.error(e); }
+    } catch (e) { 
+        console.error("🔥 FATAL SETUP ERROR: Could not connect to Kafka or Redis.", e); 
+        // The server is running, but real-time functions will be unavailable.
+    }
 })();
